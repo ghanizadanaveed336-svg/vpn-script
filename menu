@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+WG_DIR="/etc/wireguard"
+CLIENTS_DIR="$WG_DIR/clients"
+SERVER_CONFIG="$WG_DIR/wg0.conf"
+SERVER_KEY_FILE="$WG_DIR/server.key"
+SERVER_PUB_KEY_FILE="$WG_DIR/server.pub"
+LOG_FILE="/var/log/vpn-menu.log"
+
+require_root() {
+  if [[ ${EUID} -ne 0 ]]; then
+    echo "Please run as root: sudo bash menu"
+    exit 1
+  fi
+}
+
+log_msg() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE" >/dev/null
+}
+
+install_required() {
+  if ! command -v wg >/dev/null 2>&1 || ! command -v qrencode >/dev/null 2>&1; then
+    log_msg "Installing WireGuard and qrencode..."
+    apt-get update -qq
+    apt-get install -y -qq wireguard qrencode >/dev/null
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$WG_DIR" "$CLIENTS_DIR"
+  chmod 700 "$WG_DIR"
+  chmod 700 "$CLIENTS_DIR"
+}
+
+generate_server_keys() {
+  if [[ ! -f "$SERVER_KEY_FILE" ]]; then
+    wg genkey | tee "$SERVER_KEY_FILE" >/dev/null
+    chmod 600 "$SERVER_KEY_FILE"
+  fi
+
+  if [[ ! -f "$SERVER_PUB_KEY_FILE" ]]; then
+    wg pubkey < "$SERVER_KEY_FILE" > "$SERVER_PUB_KEY_FILE"
+  fi
+}
+
+get_server_pubkey() {
+  cat "$SERVER_PUB_KEY_FILE"
+}
+
+get_default_iface() {
+  ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || echo "eth0"
+}
+
+server_config_exists() {
+  [[ -f "$SERVER_CONFIG" ]]
+}
+
+write_server_config() {
+  local iface
+  iface=$(get_default_iface)
+  cat > "$SERVER_CONFIG" <<EOF
+[Interface]
+Address = 10.8.0.1/24
+SaveConfig = true
+ListenPort = 51820
+PrivateKey = $(cat "$SERVER_KEY_FILE")
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $iface -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $iface -j MASQUERADE
+EOF
+  chmod 600 "$SERVER_CONFIG"
+}
+
+enable_ip_forward() {
+  if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  fi
+  sysctl -p >/dev/null 2>&1 || true
+}
+
+next_client_ip() {
+  local last=1
+  if [[ -f "$SERVER_CONFIG" ]]; then
+    last=$(grep -E 'AllowedIPs = 10\.8\.0\.' "$SERVER_CONFIG" | awk '{print $3}' | sed 's|10\.8\.0\.||; s|/32||' | sort -n | tail -n 1 2>/dev/null || echo 1)
+  fi
+  echo $((last + 1))
+}
+
+append_peer_to_server() {
+  local user="$1"
+  local ip="$2"
+  local pub="$3"
+  cat >> "$SERVER_CONFIG" <<EOF
+
+[Peer]
+PublicKey = $pub
+AllowedIPs = 10.8.0.$ip/32
+PersistentKeepalive = 25
+# user: $user
+EOF
+}
+
+create_client_conf() {
+  local user="$1"
+  local private_key="$2"
+  local public_key="$3"
+  local ip="$4"
+
+  cat > "$CLIENTS_DIR/$user.conf" <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = 10.8.0.$ip/24
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = $(get_server_pubkey)
+Endpoint = $(hostname -I | awk '{print $1}'):$SERVER_PORT
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+
+  chmod 600 "$CLIENTS_DIR/$user.conf"
+  qrencode -t ansiutf8 -o - "$CLIENTS_DIR/$user.conf" 2>/dev/null | sed -n '1,20p' >/dev/null || true
+}
+
+add_client() {
+  local user
+  read -rp "Enter client name: " user
+  user="${user//[^a-zA-Z0-9_.-]/_}"
+
+  if [[ -z "$user" ]]; then
+    echo "Invalid client name."
+    return
+  fi
+
+  if [[ -f "$CLIENTS_DIR/$user.conf" ]]; then
+    echo "Client already exists: $user"
+    return
+  fi
+
+  local priv
+  priv=$(wg genkey)
+  local pub
+  pub=$(printf '%s' "$priv" | wg pubkey)
+  local ip
+  ip=$(next_client_ip)
+
+  append_peer_to_server "$user" "$ip" "$pub"
+  create_client_conf "$user" "$priv" "$pub" "$ip"
+
+  wg-quick down wg0 2>/dev/null || true
+  wg-quick up wg0 2>/dev/null || true
+
+  echo "Client added successfully: $user"
+  echo "Config file: $CLIENTS_DIR/$user.conf"
+  echo "Client IP: 10.8.0.$ip"
+}
+
+list_clients() {
+  if [[ ! -f "$SERVER_CONFIG" ]]; then
+    echo "No WireGuard config found."
+    return
+  fi
+
+  echo "Active VPN peers:"
+  grep -n "# user:" "$SERVER_CONFIG" || echo "No clients configured."
+}
+
+show_qr() {
+  local user
+  read -rp "Client name: " user
+  if [[ ! -f "$CLIENTS_DIR/$user.conf" ]]; then
+    echo "Config not found: $user"
+    return
+  fi
+  qrencode -t ansiutf8 -o - "$CLIENTS_DIR/$user.conf"
+}
+
+remove_client() {
+  local user
+  read -rp "Client name: " user
+  if [[ ! -f "$CLIENTS_DIR/$user.conf" ]]; then
+    echo "Config not found: $user"
+    return
+  fi
+
+  rm -f "$CLIENTS_DIR/$user.conf"
+
+  if [[ -f "$SERVER_CONFIG" ]]; then
+    cp "$SERVER_CONFIG" "$SERVER_CONFIG.bak"
+    awk -v name="$user" '
+      $0 ~ /# user: / {
+        if ($0 == "# user: " name) {
+          skip = 1
+          next
+        }
+      }
+      skip && $0 ~ /^\[/ { skip = 0 }
+      !skip { print }
+    ' "$SERVER_CONFIG" > /tmp/wg0.tmp && mv /tmp/wg0.tmp "$SERVER_CONFIG"
+  fi
+
+  wg-quick down wg0 2>/dev/null || true
+  wg-quick up wg0 2>/dev/null || true
+  echo "Client removed: $user"
+}
+
+show_status() {
+  if command -v wg >/dev/null 2>&1; then
+    wg show 2>/dev/null || echo "WireGuard is not running."
+  else
+    echo "WireGuard is not installed."
+  fi
+}
+
+start_vpn() {
+  if [[ -f "$SERVER_CONFIG" ]]; then
+    wg-quick up wg0 2>/dev/null || true
+    echo "WireGuard started."
+  else
+    echo "Server config not found. Run option 1 first."
+  fi
+}
+
+stop_vpn() {
+  wg-quick down wg0 2>/dev/null || true
+  echo "WireGuard stopped."
+}
+
+backup_config() {
+  local name
+  name="vpn-backup-$(date +%F-%H%M%S).tar.gz"
+  tar -czf "/root/$name" -C /etc/wireguard .
+  echo "Backup created: /root/$name"
+}
+
+show_menu() {
+  cat <<'EOF'
+============================================
+    VPS WireGuard VPN Manager
+============================================
+ 1) Install / Setup VPN
+ 2) Start VPN
+ 3) Stop VPN
+ 4) Status
+ 5) Add client
+ 6) Remove client
+ 7) List clients
+ 8) Show QR code for client
+ 9) Backup config
+ 0) Exit
+============================================
+EOF
+}
+
+main() {
+  require_root
+  install_required
+  ensure_dirs
+  generate_server_keys
+
+  if ! server_config_exists; then
+    write_server_config
+    enable_ip_forward
+  fi
+
+  while true; do
+    show_menu
+    read -r -p "Choose an option: " choice || break
+    case "$choice" in
+      1)
+        generate_server_keys
+        write_server_config
+        enable_ip_forward
+        start_vpn
+        ;;
+      2) start_vpn ;;
+      3) stop_vpn ;;
+      4) show_status ;;
+      5) add_client ;;
+      6) remove_client ;;
+      7) list_clients ;;
+      8) show_qr ;;
+      9) backup_config ;;
+      0)
+        echo "Goodbye."
+        exit 0
+        ;;
+      *)
+        echo "Invalid option."
+        ;;
+    esac
+    echo
+    read -r -p "Press Enter to continue..." || true
+  done
+}
+
+main "$@"
